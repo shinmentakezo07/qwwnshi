@@ -16,6 +16,7 @@
  */
 import { getBrowser } from './fireyejsRunner.ts';
 import { logStore } from './logStore.ts';
+import { Mutex } from './playwright.ts';
 import { QWEN_API_BASE } from './qwen.ts';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -164,6 +165,15 @@ interface WarmPage {
   page: any;
   lastUsed: number;
   /**
+   * Serializes requests on this page.
+   *
+   * The relay binding is per-page, so two requests running concurrently on the
+   * same page would overwrite each other's handler and cross-deliver chunks —
+   * both responses arrive corrupted and neither recalls its own context. Only
+   * one request may be in flight per page.
+   */
+  mutex: Mutex;
+  /**
    * bx-ua / bx-umidtoken harvested from the SPA's own traffic.
    *
    * AWSC attaches these only to the app's bundled HTTP client — not to a
@@ -311,7 +321,7 @@ async function createWarmPage(key: string, headers: Record<string, string>): Pro
     }
 
     logStore.log('debug', 'browser', `Warm page ready for ${key} (awsc tokens: ${got.join(', ')} from ${tokenSource})`);
-    return { context, page, lastUsed: Date.now(), bxTokens };
+    return { context, page, lastUsed: Date.now(), mutex: new Mutex(), bxTokens };
   } catch (err) {
     await context.close().catch(() => {});
     throw err;
@@ -460,6 +470,10 @@ export async function browserFetch(url: string, options: BrowserFetchOptions = {
       }
 
       entry.lastUsed = Date.now();
+
+      // One request at a time per page: the relay binding is per-page, so
+      // concurrent requests would cross-deliver each other's chunks.
+      const release = await entry.mutex.acquire();
       try {
         // Bound the request. A challenged endpoint (notably /api/v2/chats/new)
         // returns a challenge page whose body never completes, so without this
@@ -487,6 +501,8 @@ export async function browserFetch(url: string, options: BrowserFetchOptions = {
         // A dead or hung page must not be reused; drop it and retry once.
         evictWarmPage(key);
         if (attempt === 1) throw err;
+      } finally {
+        release();
       }
     }
     throw new Error(`browserFetch: unreachable for ${url.split('?')[0]}`);
