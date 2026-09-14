@@ -361,6 +361,17 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
           controller.error(err);
         }
       },
+      // Propagate a client disconnect upstream. Without this the read loop above
+      // never terminates, so the transport never learns the consumer is gone and
+      // its page (and upstream connection) leak.
+      async cancel() {
+        try {
+          await streamReader.cancel();
+        } catch {
+          /* already released */
+        }
+        qwenAbortController?.abort();
+      },
     });
 
     // Build finalPrompt for logStore debug logging only

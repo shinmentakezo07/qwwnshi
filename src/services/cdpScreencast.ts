@@ -4,9 +4,10 @@
  * streams viewport frames over WebSocket, relays input events back.
  */
 
-import { type ChildProcess, execFileSync, spawn } from 'child_process';
+import { type ChildProcess, spawn } from 'child_process';
 import { existsSync, rmSync } from 'fs';
 import WebSocket from 'ws';
+import { findChromeExecutable } from '../utils/browserBinary.ts';
 import { getProfileDir } from './browserProfiles.ts';
 import { logStore } from './logStore.ts';
 
@@ -26,41 +27,17 @@ export interface ScreencastSession {
 
 const sessions = new Map<string, ScreencastSession>();
 
-let _cachedChromeBin: string | null = null;
-function findChromeBinary(): string {
-  if (_cachedChromeBin) return _cachedChromeBin;
-  const home = process.env.HOME || '/home/youssefsrv';
-  const candidates = [
-    `${home}/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome`,
-    `${home}/.cache/puppeteer/chrome/linux-150.0.7871.24/chrome-linux64/chrome`,
-    'chromium-browser',
-    'chromium',
-    'google-chrome',
-    'google-chrome-stable',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/chromium',
-    '/usr/bin/google-chrome',
-  ];
-  for (const bin of candidates) {
-    try {
-      execFileSync(bin, ['--version'], { stdio: 'ignore' });
-      _cachedChromeBin = bin;
-      return bin;
-    } catch {}
-  }
-  // Fallback: try to find any chrome binary
-  try {
-    const result = execFileSync('find', [`${home}/.cache`, '-name', 'chrome', '-executable', '-type', 'f'], {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    const lines = result.trim().split('\n');
-    if (lines.length > 0 && lines[0]) {
-      _cachedChromeBin = lines[0].trim();
-      return _cachedChromeBin;
-    }
-  } catch {}
-  return 'chromium-browser';
+/**
+ * Find a runnable Chrome binary, or null.
+ *
+ * Delegates to the shared resolver, which discovers cache revisions by reading
+ * the directory instead of hardcoding them — the previous version here pinned
+ * "chromium-1234" and a puppeteer path that no longer exists, and fell back to
+ * the bare name "chromium-browser", which on Debian/Ubuntu is a snap stub that
+ * exits 1.
+ */
+function findChromeBinary(): string | null {
+  return findChromeExecutable();
 }
 
 export async function startScreencast(
@@ -86,6 +63,11 @@ export async function startScreencast(
     } catch {}
   }
   const chromeBin = findChromeBinary();
+  if (!chromeBin) {
+    const message = 'No runnable Chrome/Chromium binary found — run `npx playwright install` or set CHROME_PATH';
+    logStore.log('error', 'screencast', message);
+    return { error: message };
+  }
   const debugPort = 9222 + Math.floor(Math.random() * 1000);
 
   logStore.log('info', 'screencast', `Starting Chrome for ${email} on debug port ${debugPort} (bin: ${chromeBin})`);

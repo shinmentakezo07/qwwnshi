@@ -12,6 +12,7 @@
  *   browser dependency — runs once per 30 min per account.
  */
 import { resolve } from 'path';
+import { resolveChromeExecutable } from '../utils/browserBinary.ts';
 import { getBxUaToken } from './bxUaGenerator.ts';
 import { logStore } from './logStore.ts';
 import { QWEN_API_BASE } from './qwen.ts';
@@ -86,20 +87,27 @@ export async function generateBxPp(payload?: string): Promise<string | null> {
 
 let playwrightBrowser: any = null;
 
-async function getBrowser(): Promise<any> {
-  if (playwrightBrowser && !(playwrightBrowser as any)._closed) {
+export async function getBrowser(): Promise<any> {
+  // `isConnected()` — not `_closed`. Playwright's Browser has no `_closed`
+  // property (it is `undefined` both before and after close), so that guard
+  // never detected a dead browser and would hand back a broken handle.
+  if (playwrightBrowser?.isConnected()) {
     return playwrightBrowser;
   }
+  // Pass executablePath explicitly: Playwright's own pinned revision may be
+  // absent from the cache, which throws "Executable doesn't exist at ...".
+  const executablePath = resolveChromeExecutable();
   const { chromium } = await import('playwright');
   playwrightBrowser = await chromium.launch({
     headless: true,
+    executablePath,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
   return playwrightBrowser;
 }
 
 async function closeBrowser(): Promise<void> {
-  if (playwrightBrowser && !(playwrightBrowser as any)._closed) {
+  if (playwrightBrowser?.isConnected()) {
     try {
       await playwrightBrowser.close();
     } catch {
@@ -118,6 +126,11 @@ const COOKIE_REFRESH_TTL_MS = 30 * 60 * 1000; // 30 min
  * @returns Fresh cookie string or null
  */
 export async function refreshCookiesViaBrowser(cookieStr: string): Promise<string | null> {
+  // Resolve the binary before the try block: a missing browser is an
+  // environment fault, and must surface with its actionable message instead of
+  // being flattened into a bare `null` by the catch below.
+  resolveChromeExecutable();
+
   let page: any = null;
   try {
     const browser = await getBrowser();
@@ -140,6 +153,33 @@ export async function refreshCookiesViaBrowser(cookieStr: string): Promise<strin
       const html = await page.evaluate(() => document.documentElement?.innerHTML || '').catch(() => '');
       if (!html.includes('aliyun_waf')) break;
       await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    // The root page loads unchallenged, so on its own it never triggers the
+    // WAF challenge that guards /api/** and never yields the tfstk/isg cookies
+    // the API needs. Making the browser issue a real API request runs the
+    // challenge JS in its own context, which sets those cookies.
+    await page
+      .evaluate(async (base: string) => {
+        try {
+          await fetch(`${base}/api/v2/users/status`, {
+            method: 'GET',
+            headers: { accept: 'application/json, text/plain, */*', source: 'web' },
+            credentials: 'include',
+          });
+        } catch {
+          // best effort — the cookies are what matter, not the response
+        }
+      }, QWEN_API_BASE)
+      .catch(() => {});
+
+    // AWSC sets tfstk/isg asynchronously after the challenge script runs, so
+    // poll for them rather than reading cookies straight away.
+    const WAF_COOKIES = ['tfstk', 'isg'];
+    for (let i = 0; i < 12; i++) {
+      const names = (await page.context().cookies()).map((c: any) => c.name);
+      if (WAF_COOKIES.every((name) => names.includes(name))) break;
+      await new Promise((r) => setTimeout(r, 500));
     }
 
     const freshCookies = await page.context().cookies();

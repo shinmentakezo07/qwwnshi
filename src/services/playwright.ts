@@ -175,6 +175,18 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
         break;
     }
     if (browserEngine) {
+      // firefox/webkit have no equivalent of the Chromium resolver: there is no
+      // shared binary to point executablePath at, and their Playwright-pinned
+      // revisions are just as likely to be missing. Fail with the reason rather
+      // than surfacing Playwright's "Executable doesn't exist at ...".
+      // NOTE: unreachable today — initPlaywright() is only ever called with no
+      // arguments, so browserType is always 'chromium'.
+      if (browserType === 'firefox' || browserType === 'webkit') {
+        throw new Error(
+          `Browser engine '${browserType}' has no installed browser. ` +
+            "Use 'chromium' (cloakbrowser) or 'chrome'/'edge' (system-installed).",
+        );
+      }
       defaultBrowser = await browserEngine.launch({
         headless,
         channel,

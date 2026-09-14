@@ -94,3 +94,6 @@ token-usage-output.txt
 .auth/
 .cortexkit/
 test-*.ts
+
+# Captured browser sessions contain live JWTs and device tokens — never commit
+*.har

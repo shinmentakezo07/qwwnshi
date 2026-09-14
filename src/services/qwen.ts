@@ -30,7 +30,11 @@ export function buildFeatureConfig(_enableThinking: boolean): Record<string, any
 }
 export const QWEN_CHATS_URL = `${QWEN_API_BASE}/api/v2/chats/`;
 export const QWEN_MODELS_URL = `${QWEN_API_BASE}/api/models`;
-export const QWEN_BX_V = '2.5.36';
+// Must track the baxia version the Qwen web client loads, which the WAF
+// cross-checks against the bx-ua/bx-umidtoken payloads. A capture of a working
+// browser session (chat.qwen.ai.har) showed baxia/2.5.37 and a matching
+// `bx-v: 2.5.37` request header.
+export const QWEN_BX_V = '2.5.37';
 
 export class RetryableQwenStreamError extends Error {
   readonly retryAfterMs: number;
@@ -415,7 +419,10 @@ export async function createQwenStream(
       },
       body: bodyStr,
       accountEmail: currentAccountEmail,
-      stream: true, // keep session alive for streaming via impers worker
+      // Let an abort (first-chunk timeout, client disconnect) reach the
+      // transport so its page and upstream connection are released.
+      signal: streamAbortController.signal,
+      stream: true,
     });
     logStore.log(
       'debug',
