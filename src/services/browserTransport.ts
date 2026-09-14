@@ -508,54 +508,115 @@ export async function browserFetch(url: string, options: BrowserFetchOptions = {
     throw new Error(`browserFetch: unreachable for ${url.split('?')[0]}`);
   }
 
-  // ─── Streaming: dedicated context, always torn down ──────────────────
-  // A half-consumed SSE body leaves the page in an ambiguous state, so it is
-  // never returned to the pool.
-  const browser = await getBrowser();
-  const context = await browser.newContext();
+  // ─── Streaming ───────────────────────────────────────────────────────
+  // Prefer the account's warm page: navigating the SPA costs ~3.6s, which is
+  // most of a streaming request's latency. The page is returned to the pool
+  // only when the stream ends cleanly — a cancelled or failed stream leaves the
+  // page's connection state ambiguous, so it is destroyed instead.
+  const streamKey = accountEmail || '_default_';
+  startSweep();
 
-  // Closing the context settles any pending evaluate rather than leaking it.
+  let streamEntry = warmPages.get(streamKey);
+  if (streamEntry && (streamEntry.page.isClosed() || Date.now() - streamEntry.lastUsed > WARM_TTL_MS)) {
+    evictWarmPage(streamKey);
+    streamEntry = undefined;
+  }
+
+  // A pooled page is only safe when it has no other request in flight.
+  let streamRelease: (() => void) | null = null;
+  if (streamEntry) {
+    streamRelease = await streamEntry.mutex.acquire();
+  }
+
+  // Becomes true once this stream's page is registered in the pool, whether it
+  // was reused or freshly built. From then on cleanup() must release it rather
+  // than close it.
+  let pooled = streamEntry !== undefined;
+  const browser = await getBrowser();
+  const context = pooled ? streamEntry!.context : await browser.newContext();
+
   // Single-flight: cancel(), the evaluation's finally, and an abort can all race
-  // to tear the same context down.
+  // to tear the same stream down.
   let closed = false;
   const cleanup = async (): Promise<void> => {
     if (closed) return;
     closed = true;
-    try {
-      await context.close();
-    } catch {
-      /* already gone */
+    if (pooled) {
+      // Stream ended cleanly — hand the page back for the next request.
+      if (streamEntry) streamEntry.lastUsed = Date.now();
+    } else {
+      // Closing the context settles any pending evaluate rather than leaking it.
+      try {
+        await context.close();
+      } catch {
+        /* already gone */
+      }
     }
+    streamRelease?.();
+    streamRelease = null;
+  };
+
+  // A cancelled or failed stream must not return an ambiguous page to the pool.
+  const destroy = async (): Promise<void> => {
+    if (pooled) evictWarmPage(streamKey);
+    if (closed) {
+      streamRelease?.();
+      streamRelease = null;
+      return;
+    }
+    closed = true;
+    if (!pooled) {
+      try {
+        await context.close();
+      } catch {
+        /* already gone */
+      }
+    }
+    streamRelease?.();
+    streamRelease = null;
   };
 
   try {
-    const page = await context.newPage();
-
-    const cookiePairs = parseCookieHeader(headers.cookie || '');
-    if (cookiePairs.length > 0) {
-      await context.addCookies(cookiePairs.map(({ name, value }) => ({ name, value, domain: '.qwen.ai', path: '/' })));
-    }
+    const page = pooled ? streamEntry!.page : await context.newPage();
 
     // Harvest the AWSC tokens the SPA emits, same as the warm-page path.
-    const streamTokens: Record<string, string> = {};
-    page.on('request', (req: any) => {
-      try {
-        const h = req.headers();
-        for (const name of AWSC_HEADERS) {
-          if (h[name]) streamTokens[name] = h[name];
+    const streamTokens: Record<string, string> = pooled ? { ...streamEntry!.bxTokens } : {};
+    if (!pooled) {
+      page.on('request', (req: any) => {
+        try {
+          const h = req.headers();
+          for (const name of AWSC_HEADERS) {
+            if (h[name]) streamTokens[name] = h[name];
+          }
+        } catch {
+          /* headers unavailable */
         }
-      } catch {
-        /* headers unavailable */
+      });
+    }
+
+    if (!pooled) {
+      const cookiePairs = parseCookieHeader(headers.cookie || '');
+      if (cookiePairs.length > 0) {
+        await context.addCookies(cookiePairs.map(({ name, value }) => ({ name, value, domain: '.qwen.ai', path: '/' })));
       }
-    });
 
-    // Load the app first so the AWSC/baxia scripts run and populate the WAF
-    // cookies (tfstk/isg) the API expects.
-    await page.goto(QWEN_API_BASE, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS }).catch(() => {});
+      // Load the app first so the AWSC/baxia scripts run and populate the WAF
+      // cookies (tfstk/isg) the API expects.
+      await page.goto(QWEN_API_BASE, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS }).catch(() => {});
 
-    // Wait for the SPA to emit at least one token-carrying request.
-    for (let i = 0; i < 24 && !streamTokens['bx-ua']; i++) {
-      await new Promise((r) => setTimeout(r, 500));
+      // Wait for the SPA to emit at least one token-carrying request.
+      for (let i = 0; i < 24 && !streamTokens['bx-ua']; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
+      // Seed the pool so this navigation is not repeated by the next request.
+      // The entry is only used if this stream ends cleanly; `destroy()` evicts
+      // it otherwise. Registered before the request runs so the mutex it holds
+      // is the one `streamRelease` will hand back.
+      streamEntry = { context, page, lastUsed: Date.now(), mutex: new Mutex(), bxTokens: streamTokens };
+      streamRelease = await streamEntry.mutex.acquire();
+      warmPages.set(streamKey, streamEntry);
+      pooled = true;
     }
 
     const streamHeaders = withAwscTokens(sentHeaders, streamTokens);
@@ -590,16 +651,16 @@ export async function browserFetch(url: string, options: BrowserFetchOptions = {
         controller = c;
       },
       async cancel() {
-        // Client disconnected: tear down the context so the in-page reader
-        // stops instead of running to completion.
-        await cleanup();
+        // Client disconnected: the in-page reader must stop, and the page is
+        // no longer trustworthy — destroy rather than pool.
+        await destroy();
       },
     });
 
     // An abort (first-chunk timeout, client disconnect) must release the page
     // and the upstream connection, not just stop the consumer.
     signal?.addEventListener('abort', () => {
-      void cleanup();
+      void destroy();
     });
 
     runInPage(
@@ -636,6 +697,8 @@ export async function browserFetch(url: string, options: BrowserFetchOptions = {
         } catch {
           /* already closed */
         }
+        // A failed stream leaves the page in an unknown state.
+        return destroy();
       })
       .finally(() => {
         cleanup().catch(() => {});
