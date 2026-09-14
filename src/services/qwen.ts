@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { attemptTimeoutForPayload } from '../utils/requestTimeout.ts';
 import { CircuitBreaker, CircuitOpenError, withRetry } from '../utils/retry.ts';
 import { logCrash, logSessionClose } from '../utils/wreqCrashLogger.ts';
 import { decrementInFlight, getTokenWithAccount, pickAccount, throttleAccount } from './auth.ts';
@@ -255,12 +256,16 @@ export async function createQwenStream(
   if (chatId) urlObj.searchParams.set('chat_id', chatId);
   const url = urlObj.href;
 
+  // Size the per-attempt timeout to the payload. A fixed 30s is fine for a
+  // short prompt but too short for a large context — measured, a ~517K-token
+  // request needs ~41s, and the resulting failures trip the circuit breaker.
+  const payloadChars = JSON.stringify(payload).length;
   const retryConfig = {
     maxRetries: Math.max(0, config.getInt('RETRY_MAX_ATTEMPTS', 3)),
     baseDelayMs: Math.max(0, config.getInt('RETRY_BASE_DELAY_MS', 1000)),
     maxDelayMs: Math.max(0, config.getInt('RETRY_MAX_DELAY_MS', 30000)),
     backoffMultiplier: Math.max(0.1, config.getFloat('RETRY_BACKOFF_MULTIPLIER', 2)),
-    attemptTimeoutMs: 30_000,
+    attemptTimeoutMs: attemptTimeoutForPayload(payloadChars),
   };
 
   const retriesEnabled = config.getBool('RETRY_ENABLED', true);

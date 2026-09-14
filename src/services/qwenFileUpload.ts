@@ -215,11 +215,15 @@ interface ParseStatusResponse {
   status: 'running' | 'success' | 'failed';
 }
 
-async function pollParseStatus(email: string, fileId: string, maxWaitMs = 5_000): Promise<void> {
+async function pollParseStatus(email: string, fileId: string, maxWaitMs = 30_000): Promise<void> {
   const url = `${QWEN_API_BASE}/api/v2/files/parse/status`;
   const startTime = Date.now();
   const pollInterval = 1_000;
 
+  // The budget is wall-clock, and each poll costs a browser round trip
+  // (~0.4-4s). The old 5s window allowed barely one or two real polls, so a
+  // slow parse was reported as a timeout and the caller proceeded with a file
+  // the model could not read yet.
   while (Date.now() - startTime < maxWaitMs) {
     const body = JSON.stringify({ file_id_list: [fileId] });
 
